@@ -242,6 +242,17 @@ pub(super) async fn build_test_processor(
     Arc<MessageProcessor>,
     mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
 ) {
+    build_test_processor_with_state_db(config, auth_manager, None).await
+}
+
+pub(super) async fn build_test_processor_with_state_db(
+    config: Arc<Config>,
+    auth_manager: Arc<AuthManager>,
+    state_db: Option<codex_rollout::state_db::StateDbHandle>,
+) -> (
+    Arc<MessageProcessor>,
+    mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
+) {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
     let config_manager = ConfigManager::new(
         config.codex_home.to_path_buf(),
@@ -274,7 +285,7 @@ pub(super) async fn build_test_processor(
         environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
         feedback: CodexFeedback::new(),
         log_db: None,
-        state_db: None,
+        state_db,
         config_warnings: Vec::new(),
         startup_warnings_tx: mpsc::unbounded_channel().0,
         session_source: SessionSource::VSCode,

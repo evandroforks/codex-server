@@ -420,6 +420,9 @@ async fn start_listener(
                 conversation_id,
                 &listener_state,
                 connection_ids,
+                // Passive child notifications must not pin a persisted runtime forever.
+                // Ephemeral children cannot recover their context after idle eviction.
+                /*retain_runtime*/ !created || !is_v2_child || config_snapshot.ephemeral,
                 |attached| {
                     let listener_matches = state.listener_matches(&conversation);
                     if !created && conversation.has_shutdown_status() {

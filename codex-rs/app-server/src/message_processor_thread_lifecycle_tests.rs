@@ -2,6 +2,7 @@
 
 use codex_app_server_protocol::TurnStartResponse;
 use codex_features::Feature;
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::AgentStatus;
 use core_test_support::responses;
 use core_test_support::streaming_sse::StreamingSseChunk;
@@ -13,6 +14,7 @@ use tokio::sync::oneshot;
 use super::ConnectionSessionState;
 use super::MessageProcessor;
 use super::message_processor_tracing_tests::build_test_processor;
+use super::message_processor_tracing_tests::build_test_processor_with_state_db;
 use super::message_processor_tracing_tests::read_response_from;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingEnvelope;
@@ -226,11 +228,18 @@ MCP_TEST_PID_FILE = {}
     Ok(())
 }
 
-#[test_case(0, false; "v2_zero_delay")]
-#[test_case(1, false; "v2_one_second_delay")]
-#[test_case(1, true; "ephemeral_v2_followup_after_idle_deadline")]
+#[test_case(0, false, false, false; "disconnected_v2_zero_delay")]
+#[test_case(1, false, false, false; "disconnected_v2_one_second_delay")]
+#[test_case(1, true, false, false; "ephemeral_v2_followup_after_idle_deadline")]
+#[test_case(1, false, true, false; "connected_passive_child_unloads")]
+#[test_case(1, false, true, true; "connected_explicit_child_stays_loaded")]
 #[tokio::test]
-async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool) -> Result<()> {
+async fn v2_child_idle_lifecycle(
+    unload_delay_secs: u64,
+    ephemeral: bool,
+    connected: bool,
+    explicit_child: bool,
+) -> Result<()> {
     let (release_spawn, spawn_gate) = oneshot::channel();
     let (release_spawn_completion, spawn_completion_gate) = oneshot::channel();
     let (release_first_completion, first_completion_gate) = oneshot::channel();
@@ -298,12 +307,26 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
     ])
     .await;
     let home = TempDir::new()?;
-    let config = MockResponsesConfig::new(server.uri())
+    let mut config = MockResponsesConfig::new(server.uri())
         .with_root_config(&format!(
             "thread_unload_delay_secs = {unload_delay_secs}\napprovals_reviewer = \"user\""
         ))
         .enable_feature(Feature::Collab)
         .enable_feature(Feature::MultiAgentV2);
+    let pid_file = home.path().join("mcp.pid");
+    if connected {
+        config = config.with_extra_config(&format!(
+            r#"[mcp_servers.owned]
+command = {}
+required = true
+enabled_tools = []
+[mcp_servers.owned.env]
+MCP_TEST_PID_FILE = {}
+"#,
+            toml::Value::String(stdio_server_bin()?),
+            toml::Value::String(pid_file.to_string_lossy().into_owned()),
+        ));
+    }
     config.write(home.path())?;
     let config = Arc::new(
         ConfigBuilder::default()
@@ -314,7 +337,20 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
     let auth =
         AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false)
             .await?;
-    let (processor, mut outgoing) = build_test_processor(config, auth).await;
+    // Running paginated resume needs the production store's turn/item listing APIs.
+    let state_db = if explicit_child {
+        Some(
+            codex_state::StateRuntime::init(
+                config.sqlite_config().clone(),
+                config.model_provider_id.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let (processor, mut outgoing) =
+        build_test_processor_with_state_db(config, auth, state_db).await;
     let mut created = processor.thread_created_receiver();
     let owner_id = ConnectionId(1);
     let owner = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
@@ -343,6 +379,11 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
         .await;
         let parent: ThreadStartResponse =
             read_response_from(&mut outgoing, owner_id, /*request_id*/ 2).await;
+        let parent_pid = if connected {
+            Some(wait_for_pid_file(&pid_file).await?)
+        } else {
+            None
+        };
         send_request(
             &processor,
             owner_id,
@@ -361,9 +402,9 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
         )
         .await?;
 
-        // Finish connection cleanup before the model can create a child. Dispatch the
-        // core creation event exactly as the app-server does with no initialized clients.
-        processor.connection_closed(owner_id, &owner).await;
+        if !connected {
+            processor.connection_closed(owner_id, &owner).await;
+        }
         release_spawn.send(()).expect("parent response is waiting");
         let child_id = timeout(Duration::from_secs(/*secs*/ 10), created.recv()).await??;
         let child_runtime = Arc::downgrade(
@@ -373,7 +414,13 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
                 .get_thread(child_id)
                 .await?,
         );
-        let attach = processor.try_attach_thread_listener(child_id, Vec::new());
+        // Dispatch creation with the same client inventory used by the transport loop.
+        let connection_ids = if connected {
+            vec![owner_id]
+        } else {
+            Vec::new()
+        };
+        let attach = processor.try_attach_thread_listener(child_id, connection_ids.clone());
         tokio::pin!(attach);
         // The old runtime has left core, but its app-server cleanup still owns the ID.
         let pending = &processor.thread_processor.pending_thread_unloads;
@@ -394,6 +441,34 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
             server.wait_for_request_count(/*count*/ 2),
         )
         .await?;
+
+        let child_pid = if connected {
+            let pid = wait_for_pid_file(&pid_file).await?;
+            assert_ne!(Some(&pid), parent_pid.as_ref());
+            Some(pid)
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        let _ = &child_pid;
+        if explicit_child {
+            send_request(
+                &processor,
+                owner_id,
+                &owner,
+                json!({"id": 4, "method": "thread/resume", "params": {
+                    "threadId": child_id.to_string()
+                }}),
+            )
+            .await;
+            let resumed: codex_app_server_protocol::ThreadResumeResponse =
+                read_response_from(&mut outgoing, owner_id, /*request_id*/ 4).await;
+            assert_eq!(resumed.thread.id, child_id.to_string());
+            // A late duplicate creation callback must not downgrade explicit interest.
+            processor
+                .try_attach_thread_listener(child_id, connection_ids)
+                .await;
+        }
         release_spawn_completion
             .send(())
             .expect("spawn completion is waiting");
@@ -486,6 +561,61 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
             .send(())
             .expect("second completion is waiting");
 
+        if connected {
+            timeout(Duration::from_secs(/*secs*/ 10), async {
+                loop {
+                    if let OutgoingEnvelope::ToConnection {
+                        connection_id,
+                        message: OutgoingMessage::AppServerNotification(notification),
+                        ..
+                    } = outgoing.recv().await.expect("outgoing channel stays open")
+                        && connection_id == owner_id
+                        && let ServerNotification::TurnCompleted(params) = notification.notification
+                        && params.thread_id == child_id.to_string()
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .context("passive subscribers must receive the child's terminal event")?;
+        }
+        if explicit_child {
+            let closed = timeout(Duration::from_secs(unload_delay_secs + 1), async {
+                loop {
+                    if let OutgoingEnvelope::Broadcast {
+                        message: OutgoingMessage::AppServerNotification(notification),
+                    } = outgoing.recv().await.expect("outgoing channel stays open")
+                        && let ServerNotification::ThreadClosed(params) = notification.notification
+                        && params.thread_id == child_id.to_string()
+                    {
+                        break;
+                    }
+                }
+            })
+            .await;
+            assert!(
+                closed.is_err(),
+                "explicitly followed child must stay loaded"
+            );
+            assert!(child_runtime.upgrade().is_some());
+            send_request(
+                &processor,
+                owner_id,
+                &owner,
+                json!({"id": 5, "method": "thread/unsubscribe", "params": {
+                    "threadId": child_id.to_string()
+                }}),
+            )
+            .await;
+            let unsubscribed: codex_app_server_protocol::ThreadUnsubscribeResponse =
+                read_response_from(&mut outgoing, owner_id, /*request_id*/ 5).await;
+            assert_eq!(
+                unsubscribed.status,
+                codex_app_server_protocol::ThreadUnsubscribeStatus::Unsubscribed
+            );
+        }
+
         // Check both registry cleanup and runtime release, regardless of the order
         // in which the parent and child finish unloading.
         timeout(Duration::from_secs(/*secs*/ 10), async {
@@ -495,14 +625,26 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
                     .thread_manager
                     .list_thread_ids()
                     .await;
-                if loaded.is_empty() && child_runtime.upgrade().is_none() {
+                let expected = if connected {
+                    vec![ThreadId::from_string(&parent.thread.id).expect("parent ID")]
+                } else {
+                    Vec::new()
+                };
+                if loaded == expected && child_runtime.upgrade().is_none() {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .context("parent and disconnected child still retain their runtimes")?;
+        .context("idle child still retains its runtime")?;
+        #[cfg(unix)]
+        if let Some(child_pid) = child_pid {
+            core_test_support::process::wait_for_process_exit(&child_pid).await?;
+            assert!(core_test_support::process::process_is_alive(
+                parent_pid.as_ref().expect("parent MCP PID")
+            )?);
+        }
         Ok(())
     }
     .await;

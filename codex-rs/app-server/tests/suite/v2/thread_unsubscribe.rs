@@ -629,6 +629,7 @@ async fn v2_child_idle_eviction_preserves_mail_and_followup_context() -> Result<
     MockResponsesConfig::new(&server.uri())
         .with_model("gpt-5.5")
         .enable_feature(Feature::MultiAgentV2)
+        .enable_feature(Feature::MultiAgentV2DynamicTools)
         .enable_feature(Feature::CodeMode)
         .enable_feature(Feature::CodeModeHost)
         .with_root_config("thread_unload_delay_secs = 0")
@@ -649,7 +650,18 @@ enabled_tools = []
         .with_env_overrides(&[("CODEX_ROLLOUT_TRACE_ROOT", traces.path().to_str())])
         .build_initialized()
         .await?;
-    let parent = mcp.start_thread(ThreadStartParams::default()).await?.thread;
+    let parent = mcp
+        .start_thread(ThreadStartParams {
+            dynamic_tools: Some(vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
+                name: "hold_child".to_string(),
+                description: "Hold the child until its explicit subscription is installed".to_string(),
+                input_schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+                defer_loading: false,
+            })]),
+            ..Default::default()
+        })
+        .await?
+        .thread;
     let mut child_id = None;
 
     for (tool, args) in [
@@ -705,7 +717,15 @@ enabled_tools = []
                         && !String::from_utf8_lossy(&request.body).contains(&expected_call_id)
                 },
                 responses::sse(vec![
-                    responses::ev_custom_tool_call(&exec_call_id, "exec", "text('child cell')"),
+                    responses::ev_custom_tool_call(
+                        &exec_call_id,
+                        "exec",
+                        if tool == "spawn_agent" {
+                            "await tools.hold_child({}); text('child cell');"
+                        } else {
+                            "text('child cell')"
+                        },
+                    ),
                     responses::ev_completed("child-exec"),
                 ]),
             )
@@ -737,6 +757,40 @@ enabled_tools = []
             }),
         )
         .await??;
+
+        if tool == "spawn_agent" {
+            let request = timeout(
+                DEFAULT_READ_TIMEOUT,
+                mcp.read_stream_until_request_message(),
+            )
+            .await??;
+            let ServerRequest::DynamicToolCall { request_id, params } = request else {
+                panic!("expected child dynamic tool call, got {request:?}");
+            };
+            assert_ne!(params.thread_id, parent.id);
+            assert_eq!(params.tool, "hold_child");
+            assert_eq!(params.arguments, json!({}));
+            let resumed: ThreadResumeResponse = mcp
+                .request(|request_id| ClientRequest::ThreadResume {
+                    request_id,
+                    params: ThreadResumeParams {
+                        thread_id: params.thread_id.clone(),
+                        ..Default::default()
+                    },
+                })
+                .await?;
+            assert_eq!(resumed.thread.id, params.thread_id);
+            mcp.send_response(
+                request_id,
+                serde_json::to_value(DynamicToolCallResponse {
+                    content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                        text: "released".to_string(),
+                    }],
+                    success: true,
+                })?,
+            )
+            .await?;
+        }
 
         if tool != "send_message" {
             let completed = timeout(

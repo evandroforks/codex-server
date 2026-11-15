@@ -1,0 +1,5 @@
+*
+!dev.Dockerfile
+!third_party/
+!third_party/v8/
+!third_party/v8/rusty_v8_152_2_0_release_manifests.sha256

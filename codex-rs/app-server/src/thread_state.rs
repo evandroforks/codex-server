@@ -363,7 +363,9 @@ mod tests {
 struct ThreadEntry {
     state: Arc<Mutex<ThreadState>>,
     connection_ids: HashSet<ConnectionId>,
+    retaining_connection_ids: HashSet<ConnectionId>,
     has_connections_watcher: watch::Sender<bool>,
+    has_retaining_connections_watcher: watch::Sender<bool>,
 }
 
 impl Default for ThreadEntry {
@@ -377,7 +379,9 @@ impl ThreadEntry {
         Self {
             state,
             connection_ids: HashSet::new(),
+            retaining_connection_ids: HashSet::new(),
             has_connections_watcher: watch::channel(false).0,
+            has_retaining_connections_watcher: watch::channel(false).0,
         }
     }
 
@@ -387,6 +391,14 @@ impl ThreadEntry {
             *current = !self.connection_ids.is_empty();
             prev != *current
         });
+        let _ = self
+            .has_retaining_connections_watcher
+            .send_if_modified(|current| {
+                let next = !self.retaining_connection_ids.is_empty();
+                let changed = *current != next;
+                *current = next;
+                changed
+            });
     }
 }
 
@@ -584,7 +596,7 @@ impl ThreadStateManager {
         }
     }
 
-    /// Removes an unsubscribed listener's entry without clearing a replacement's state.
+    /// Removes an unretained listener's entry without clearing a replacement's state.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "the listener generation must stay fixed while removing its map entry"
@@ -599,12 +611,16 @@ impl ThreadStateManager {
         let mut state = self.state.lock().await;
         if thread_state.listener_generation != generation
             || !state.threads.get(&thread_id).is_some_and(|entry| {
-                Arc::ptr_eq(&entry.state, expected) && entry.connection_ids.is_empty()
+                Arc::ptr_eq(&entry.state, expected) && entry.retaining_connection_ids.is_empty()
             })
         {
             return false;
         }
         state.threads.remove(&thread_id);
+        state.thread_ids_by_connection.retain(|_, thread_ids| {
+            thread_ids.remove(&thread_id);
+            !thread_ids.is_empty()
+        });
         self.unregister_listener_command_tx(thread_id);
         thread_state.clear_listener();
         true
@@ -657,6 +673,7 @@ impl ThreadStateManager {
             }
             if let Some(thread_entry) = state.threads.get_mut(&thread_id) {
                 thread_entry.connection_ids.remove(&connection_id);
+                thread_entry.retaining_connection_ids.remove(&connection_id);
                 thread_entry.update_has_connections();
             }
         };
@@ -680,6 +697,7 @@ impl ThreadStateManager {
         thread_id: ThreadId,
         candidate: &ListenerStateCandidate,
         connection_ids: &[ConnectionId],
+        retain_runtime: bool,
         install: impl FnOnce(bool) -> Result<T, E>,
     ) -> Result<Option<(T, watch::Receiver<bool>, bool)>, E> {
         let mut state = self.state.lock().await;
@@ -706,12 +724,15 @@ impl ThreadStateManager {
                     .or_default()
                     .insert(thread_id);
                 entry.connection_ids.insert(connection_id);
+                if retain_runtime {
+                    entry.retaining_connection_ids.insert(connection_id);
+                }
             }
         }
         entry.update_has_connections();
         Ok(Some((
             installed,
-            entry.has_connections_watcher.subscribe(),
+            entry.has_retaining_connections_watcher.subscribe(),
             attached,
         )))
     }
@@ -732,6 +753,7 @@ impl ThreadStateManager {
             .insert(thread_id);
         let thread_entry = state.threads.entry(thread_id).or_default();
         thread_entry.connection_ids.insert(connection_id);
+        thread_entry.retaining_connection_ids.insert(connection_id);
         thread_entry.update_has_connections();
         true
     }
@@ -747,6 +769,7 @@ impl ThreadStateManager {
             for thread_id in &thread_ids {
                 if let Some(thread_entry) = state.threads.get_mut(thread_id) {
                     thread_entry.connection_ids.remove(&connection_id);
+                    thread_entry.retaining_connection_ids.remove(&connection_id);
                     thread_entry.update_has_connections();
                 }
             }
@@ -772,5 +795,136 @@ impl ThreadStateManager {
             .threads
             .get(&thread_id)
             .map(|thread_entry| thread_entry.has_connections_watcher.subscribe())
+    }
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+    use std::convert::Infallible;
+    use test_case::test_case;
+
+    #[test_case(true; "explicit before automatic")]
+    #[test_case(false; "explicit after automatic")]
+    #[tokio::test]
+    async fn automatic_subscription_preserves_explicit_retention(explicit_first: bool) {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let connection_id = ConnectionId(1);
+        manager
+            .connection_initialized(connection_id, ConnectionCapabilities::default())
+            .await;
+        let candidate = manager.created_listener_state(thread_id).await;
+        let order = if explicit_first {
+            [true, false]
+        } else {
+            [false, true]
+        };
+        for retain_runtime in order {
+            let (_, retaining, attached) = manager
+                .subscribe_and_install_listener(
+                    thread_id,
+                    &candidate,
+                    &[connection_id],
+                    retain_runtime,
+                    |_| Ok::<_, Infallible>(()),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(attached);
+            assert_eq!(*retaining.borrow(), explicit_first || retain_runtime);
+            assert_eq!(
+                manager.subscribed_connection_ids(thread_id).await,
+                vec![connection_id]
+            );
+        }
+        assert!(
+            manager
+                .unsubscribe_connection_from_thread(thread_id, connection_id)
+                .await
+        );
+        assert!(!manager.has_subscribers(thread_id).await);
+        assert!(
+            manager
+                .state
+                .lock()
+                .await
+                .thread_ids_by_connection
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn implicit_listener_removal_cleans_membership_and_checks_generation() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let connection_id = ConnectionId(1);
+        manager
+            .connection_initialized(connection_id, ConnectionCapabilities::default())
+            .await;
+        let candidate = manager.created_listener_state(thread_id).await;
+        let (_, retaining, _) = manager
+            .subscribe_and_install_listener(thread_id, &candidate, &[connection_id], false, |_| {
+                Ok::<_, Infallible>(())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(manager.has_subscribers(thread_id).await);
+        assert!(!*retaining.borrow());
+        assert!(
+            !manager
+                .remove_unsubscribed_listener(thread_id, candidate.state(), 1)
+                .await
+        );
+        assert!(manager.has_subscribers(thread_id).await);
+        assert!(
+            manager
+                .remove_unsubscribed_listener(thread_id, candidate.state(), 0)
+                .await
+        );
+        let state = manager.state.lock().await;
+        assert!(state.threads.is_empty());
+        assert!(state.thread_ids_by_connection.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_connection_blocks_removal_until_disconnect() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let connection_id = ConnectionId(1);
+        manager
+            .connection_initialized(connection_id, ConnectionCapabilities::default())
+            .await;
+        let candidate = manager.created_listener_state(thread_id).await;
+        let (_, retaining, _) = manager
+            .subscribe_and_install_listener(thread_id, &candidate, &[connection_id], false, |_| {
+                Ok::<_, Infallible>(())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            manager
+                .try_add_connection_to_thread(thread_id, connection_id)
+                .await
+        );
+        assert!(*retaining.borrow());
+        assert!(
+            !manager
+                .remove_unsubscribed_listener(thread_id, candidate.state(), 0)
+                .await
+        );
+        assert_eq!(
+            manager.remove_connection(connection_id).await,
+            vec![thread_id]
+        );
+        assert!(!*retaining.borrow());
+        assert!(
+            manager
+                .remove_unsubscribed_listener(thread_id, candidate.state(), 0)
+                .await
+        );
     }
 }
