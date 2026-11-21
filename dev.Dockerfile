@@ -54,7 +54,6 @@ RUN groupadd --gid "${USER_GID}" developer \
 
 ENV CARGO_HOME=/opt/cargo \
     CARGO_TARGET_DIR=/opt/target \
-    CARGO_BUILD_JOBS=2 \
     NEXTEST_PROFILE=local \
     RUSTY_V8_ARCHIVE=/opt/v8/archive.a.gz \
     RUSTY_V8_SRC_BINDING_PATH=/opt/v8/binding.rs \
